@@ -32,6 +32,8 @@ import shutil
 import subprocess
 import threading
 import queue
+import socket
+import json
 import configparser
 import tkinter as tk
 from tkinter import ttk
@@ -66,6 +68,11 @@ DEFAULTS = {
     # separados por virgula. Uma pasta listada e sincronizada por completo,
     # com todas as suas subpastas.
     "itens_sincronizados": "",
+    # Pasta compartilhada (no servidor) onde este terminal grava um
+    # arquivo de status a cada execucao, para alimentar o Painel de
+    # Monitoramento. Deixe em branco para desativar esse recurso.
+    # Ex: \\Servidor\10.7\_status
+    "status_dir": "",
 }
 
 CHUNK_SIZE = 1024 * 1024  # 1 MB por leitura, usado para progresso suave
@@ -158,6 +165,7 @@ def carregar_configuracoes(local_dir: str, log_debug) -> dict:
         "copy_retry_wait": secao.getint("copy_retry_wait", fallback=2),
         "arquivos_protegidos": lista_protegidos,
         "itens_sincronizados": lista_sincronizados,
+        "status_dir": secao.get("status_dir", DEFAULTS["status_dir"]).strip(),
     }
     log_debug(f"DIAGNOSTICO: configuracao final em uso -> "
               f"server_dir='{resultado['server_dir']}' | "
@@ -193,6 +201,12 @@ COPY_RETRIES = CFG["copy_retries"]
 COPY_RETRY_WAIT = CFG["copy_retry_wait"]
 ARQUIVOS_PROTEGIDOS = CFG["arquivos_protegidos"]
 ITENS_SINCRONIZADOS = CFG["itens_sincronizados"]
+STATUS_DIR = CFG["status_dir"]
+NOME_TERMINAL = socket.gethostname()
+# Nome usado para identificar o SISTEMA (nao so o terminal) no arquivo de
+# status - assim, se o mesmo computador rodar IniciarERP e IniciarNFCe,
+# cada um grava seu proprio arquivo, sem um sobrescrever o outro.
+NOME_SISTEMA_STATUS = os.path.splitext(EXE_NAME)[0]
 
 LOCAL_EXE = os.path.join(LOCAL_DIR, EXE_NAME)
 LOCAL_VERSION_FILE = os.path.join(LOCAL_DIR, VERSION_FILE)
@@ -217,6 +231,61 @@ def log(mensagem: str) -> None:
         # Se nem o log puder ser gravado (ex: pasta sem permissao de escrita),
         # o programa nao deve travar por isso - so ignora silenciosamente.
         pass
+
+
+def reportar_status(situacao: str, mensagem: str = "") -> None:
+    """
+    Grava um arquivo de status (JSON) na pasta compartilhada do servidor
+    (status_dir), para que o Painel de Monitoramento consiga ver em tempo
+    real a situacao de cada terminal. Se status_dir nao estiver
+    configurado, esta funcao nao faz nada (recurso opcional).
+
+    situacao esperada: "atualizado", "desatualizado", "atualizando",
+    "erro". O nome do arquivo gravado e o nome do computador (hostname),
+    entao cada terminal escreve sempre no mesmo arquivo (sobrescrevendo o
+    anterior) - nao ha acumulo de arquivos com o tempo.
+    """
+    if not STATUS_DIR:
+        return
+
+    try:
+        os.makedirs(STATUS_DIR, exist_ok=True)
+        versao_local = ler_versao(LOCAL_VERSION_FILE)
+        versao_servidor = ler_versao(SERVER_VERSION_FILE) if os.path.isdir(SERVER_DIR) else ""
+
+        try:
+            ip_local = socket.gethostbyname(socket.gethostname())
+        except Exception:
+            ip_local = ""
+
+        dados = {
+            "terminal": NOME_TERMINAL,
+            "ip": ip_local,
+            "sistema": NOME_SISTEMA_STATUS,
+            "exe_name": EXE_NAME,
+            "versao_local": versao_local,
+            "versao_servidor": versao_servidor,
+            # Caminho completo do versao.txt do servidor - permite ao
+            # Painel reler a versao publicada agora mesmo (em tempo real),
+            # em vez de confiar apenas no que este terminal viu por ultimo.
+            "arquivo_versao_servidor": SERVER_VERSION_FILE,
+            "situacao": situacao,
+            "mensagem": mensagem,
+            "data_hora": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "pasta_local": LOCAL_DIR,
+        }
+
+        caminho = os.path.join(STATUS_DIR, f"{NOME_TERMINAL}_{NOME_SISTEMA_STATUS}.json")
+        # Grava em um arquivo temporario e depois renomeia (os.replace e
+        # atomico no Windows), evitando que o painel leia um arquivo
+        # parcialmente escrito no meio de uma atualizacao concorrente.
+        caminho_temp = caminho + ".tmp"
+        with open(caminho_temp, "w", encoding="utf-8") as f:
+            json.dump(dados, f, ensure_ascii=False, indent=2)
+        os.replace(caminho_temp, caminho)
+
+    except Exception as e:
+        log(f"AVISO: falha ao gravar status no painel de monitoramento: {e}")
 
 
 # =============================================================================
@@ -515,6 +584,8 @@ def executar_atualizacao(janela: JanelaProgresso) -> None:
     Executa todo o fluxo de atualizacao, atualizando a janela de progresso.
     Ao final, fecha a janela e abre o sistema (sucesso ou nao).
     """
+    resultado = {"situacao": "atualizado", "mensagem": "Atualizacao concluida."}
+
     try:
         janela.atualizar("Verificando servidor...", 0)
         log("Atualizacao necessaria. Iniciando processo.")
@@ -549,6 +620,7 @@ def executar_atualizacao(janela: JanelaProgresso) -> None:
             if falhas > 0:
                 log(f"ERRO: {falhas} arquivo(s) nao puderam ser copiados.")
                 janela.atualizar(f"Atencao: {falhas} arquivo(s) com falha na copia", 88)
+                resultado = {"situacao": "erro", "mensagem": f"{falhas} arquivo(s) com falha na copia."}
                 time.sleep(2)
             else:
                 log(f"Copia concluida com sucesso ({len(arquivos)} arquivo(s)).")
@@ -563,6 +635,7 @@ def executar_atualizacao(janela: JanelaProgresso) -> None:
                 log(f"Versao local atualizada para {versao_servidor}.")
             except Exception as e:
                 log(f"ERRO: falha ao gravar arquivo de versao local: {e}")
+                resultado = {"situacao": "erro", "mensagem": f"Falha ao gravar versao local: {e}"}
 
         janela.atualizar("Atualizacao concluida!", 100)
         time.sleep(0.6)
@@ -570,9 +643,12 @@ def executar_atualizacao(janela: JanelaProgresso) -> None:
     except Exception as e:
         log(f"ERRO inesperado durante a atualizacao: {e}")
         janela.atualizar("Ocorreu um erro, abrindo o sistema...", 100)
+        resultado = {"situacao": "erro", "mensagem": f"Erro inesperado: {e}"}
         time.sleep(1)
 
     finally:
+        reportar_status(resultado["situacao"], resultado["mensagem"])
+
         # IMPORTANTE: abrir o sistema ANTES de fechar a janela.
         # janela.fechar() chama destroy(), o que encerra o mainloop() que
         # esta rodando na thread principal. Quando o mainloop termina, o
@@ -662,6 +738,7 @@ def main() -> None:
         # Servidor fora do ar / sem acesso -> nao bloqueia o usuario,
         # apenas registra e abre a versao local direto, sem delay.
         log(f"AVISO: servidor indisponivel ou sem acesso ({SERVER_DIR}).")
+        reportar_status("erro", "Servidor indisponivel ou sem acesso.")
         if not abrir_sistema():
             sys.exit(1)
         return
@@ -670,11 +747,13 @@ def main() -> None:
         # Caminho "feliz": sem atualizacao -> abre IMEDIATAMENTE,
         # nenhuma janela e desenhada, sem delay perceptivel.
         log("Sistema ja atualizado. Abrindo sem atualizacao.")
+        reportar_status("atualizado", "Nenhuma atualizacao necessaria.")
         if not abrir_sistema():
             sys.exit(1)
         return
 
     # A partir daqui, ha atualizacao pendente -> mostra a janela de progresso
+    reportar_status("atualizando", "Atualizacao em andamento.")
     janela = JanelaProgresso()
     thread_trabalho = threading.Thread(target=executar_atualizacao, args=(janela,), daemon=True)
     thread_trabalho.start()

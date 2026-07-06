@@ -117,6 +117,28 @@ if errorlevel 1 (
 )
 
 REM ----------------------------------------------------------------------
+REM PASSO 6B - Compila o PainelStatus.exe (roda no servidor, com console
+REM            visivel, para exibir o endereco de acesso e permitir
+REM            encerrar com CTRL+C)
+REM ----------------------------------------------------------------------
+if exist "%~dp0PainelStatus.py" (
+    echo.
+    echo [INFO] Compilando PainelStatus.exe, aguarde...
+    echo.
+    python -m PyInstaller --onefile --name PainelStatus PainelStatus.py
+
+    if errorlevel 1 (
+        echo.
+        echo [ERRO] A compilacao do PainelStatus.exe falhou. Verifique as mensagens acima.
+        echo.
+        pause
+        exit /b 1
+    )
+) else (
+    echo [AVISO] PainelStatus.py nao encontrado - pulando a compilacao do painel.
+)
+
+REM ----------------------------------------------------------------------
 REM PASSO 7 - Organiza a saida em duas pastas prontas para distribuicao:
 REM           Distribuir\ERP  e  Distribuir\NFCe
 REM ----------------------------------------------------------------------
@@ -142,16 +164,27 @@ if exist "%~dp0config_nfce.ini" (
     echo         criar um antes de distribuir o IniciarNFCe para os terminais.
 )
 
+set "SAIDA_PAINEL=%~dp0Distribuir\Painel"
+if exist "%~dp0dist\PainelStatus.exe" (
+    if not exist "%SAIDA_PAINEL%" mkdir "%SAIDA_PAINEL%"
+    copy /y "%~dp0dist\PainelStatus.exe" "%SAIDA_PAINEL%\PainelStatus.exe" >nul
+    if exist "%~dp0painel_config.ini" (
+        copy /y "%~dp0painel_config.ini" "%SAIDA_PAINEL%\painel_config.ini" >nul
+    )
+)
+
 echo.
 echo ============================================================
 echo   [OK] Compilacao concluida!
 echo.
-echo   IniciarERP.exe  + config.ini   -^> %SAIDA_ERP%
-echo   IniciarNFCe.exe + config.ini   -^> %SAIDA_NFCE%
+echo   IniciarERP.exe   + config.ini          -^> %SAIDA_ERP%
+echo   IniciarNFCe.exe  + config.ini          -^> %SAIDA_NFCE%
+echo   PainelStatus.exe + painel_config.ini   -^> %SAIDA_PAINEL%
 echo.
-echo   Copie cada par de arquivos para a pasta de instalacao
-echo   correspondente em cada terminal (ERP e/ou NFCe) e ajuste
-echo   o server_dir do config.ini de cada um.
+echo   Copie IniciarERP/IniciarNFCe para os terminais e ajuste o
+echo   server_dir e status_dir de cada config.ini.
+echo   Copie o PainelStatus para o SERVIDOR e rode-o la para
+echo   abrir o painel em http://SERVIDOR:8090
 echo ============================================================
 echo.
 pause
