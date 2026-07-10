@@ -34,6 +34,7 @@ import threading
 import queue
 import socket
 import json
+import fnmatch
 import configparser
 import tkinter as tk
 from tkinter import ttk
@@ -73,6 +74,12 @@ DEFAULTS = {
     # Monitoramento. Deixe em branco para desativar esse recurso.
     # Ex: \\Servidor\10.7\_status
     "status_dir": "",
+    # AUTENTICACAO DE REDE (opcional). Preencha se o compartilhamento do
+    # servidor exige usuario e senha e o terminal nao autentica sozinho
+    # (aparece um pop-up de senha do Windows, travando a automacao).
+    # Deixe os dois em branco se o compartilhamento ja funciona sem senha.
+    "network_user": "",
+    "network_password": "",
 }
 
 CHUNK_SIZE = 1024 * 1024  # 1 MB por leitura, usado para progresso suave
@@ -166,6 +173,8 @@ def carregar_configuracoes(local_dir: str, log_debug) -> dict:
         "arquivos_protegidos": lista_protegidos,
         "itens_sincronizados": lista_sincronizados,
         "status_dir": secao.get("status_dir", DEFAULTS["status_dir"]).strip(),
+        "network_user": secao.get("network_user", DEFAULTS["network_user"]).strip(),
+        "network_password": secao.get("network_password", DEFAULTS["network_password"]),
     }
     log_debug(f"DIAGNOSTICO: configuracao final em uso -> "
               f"server_dir='{resultado['server_dir']}' | "
@@ -202,6 +211,8 @@ COPY_RETRY_WAIT = CFG["copy_retry_wait"]
 ARQUIVOS_PROTEGIDOS = CFG["arquivos_protegidos"]
 ITENS_SINCRONIZADOS = CFG["itens_sincronizados"]
 STATUS_DIR = CFG["status_dir"]
+NETWORK_USER = CFG["network_user"]
+NETWORK_PASSWORD = CFG["network_password"]
 NOME_TERMINAL = socket.gethostname()
 # Nome usado para identificar o SISTEMA (nao so o terminal) no arquivo de
 # status - assim, se o mesmo computador rodar IniciarERP e IniciarNFCe,
@@ -299,6 +310,51 @@ def ler_versao(caminho: str) -> str:
             return f.read().strip()
     except Exception:
         return ""
+
+
+def autenticar_conexao_rede() -> None:
+    """
+    Autentica a conexao com o compartilhamento de rede usando o comando
+    nativo do Windows "net use", SEM abrir nenhum pop-up de senha.
+
+    Isso resolve o problema em que o Windows exige usuario/senha para
+    acessar a pasta compartilhada e, sem ninguem para digitar (execucao
+    automatica), a atualizacao trava esperando uma janela que nunca sera
+    respondida. Preenchendo network_user e network_password no config.ini,
+    o programa se autentica sozinho antes de checar o servidor.
+
+    Se network_user estiver vazio, esta funcao nao faz nada (recurso
+    opcional - use apenas se o compartilhamento realmente pedir senha).
+    """
+    if not NETWORK_USER:
+        return
+
+    try:
+        # Remove qualquer conexao anterior com este servidor antes de
+        # autenticar de novo. Isso evita o erro "multiplas conexoes com
+        # credenciais diferentes" (codigo 1219), que acontece se o
+        # Windows ja tiver uma sessao aberta com outro usuario/senha.
+        subprocess.run(
+            ["net", "use", SERVER_DIR, "/delete", "/y"],
+            capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW
+        )
+
+        resultado = subprocess.run(
+            ["net", "use", SERVER_DIR, f"/user:{NETWORK_USER}", NETWORK_PASSWORD],
+            capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
+        )
+
+        if resultado.returncode == 0:
+            log(f"Conexao de rede autenticada com sucesso (usuario: {NETWORK_USER}).")
+        else:
+            # Nao trava o programa por causa disso - so registra o aviso.
+            # servidor_disponivel() vai tratar o acesso como indisponivel
+            # normalmente, e o sistema abre com a versao local mesmo assim.
+            saida = (resultado.stdout + resultado.stderr).strip()
+            log(f"AVISO: falha ao autenticar conexao de rede (net use): {saida}")
+
+    except Exception as e:
+        log(f"AVISO: erro inesperado ao tentar autenticar conexao de rede: {e}")
 
 
 def servidor_disponivel() -> bool:
@@ -415,6 +471,15 @@ def _avaliar_candidato(caminho_relativo: str, lista_destino: list) -> bool:
     return False
 
 
+def _e_padrao_coringa(item: str) -> bool:
+    """
+    Verifica se um item de itens_sincronizados e um padrao com coringa
+    (contem * ou ?), como "*.dll", em vez de um nome de arquivo ou pasta
+    especifico.
+    """
+    return "*" in item or "?" in item
+
+
 def listar_arquivos_a_copiar() -> list:
     """
     Monta a lista de arquivos que precisam ser copiados do servidor,
@@ -431,6 +496,13 @@ def listar_arquivos_a_copiar() -> list:
     Usado, por exemplo, pelo IniciarNFCe, que so precisa manter atualizados
     o executavel e a pasta de Relatorios, sem tocar em mais nada.
 
+    Cada item da lista branca pode ser:
+      - um nome de arquivo especifico (ex: SpeedyErp.exe)
+      - um nome de pasta (ex: Relatorios - sincronizada por completo)
+      - um padrao com coringa (ex: *.dll - pega os arquivos com essa
+        extensao que estiverem na PASTA RAIZ do servidor; nao entra em
+        subpastas)
+
     Em ambos os modos, arquivos protegidos (arquivos_protegidos) sao
     SEMPRE ignorados, mesmo que estejam dentro de um item da lista branca.
     Retorna lista de tuplas: (origem, destino, tamanho_em_bytes)
@@ -441,6 +513,34 @@ def listar_arquivos_a_copiar() -> list:
     if ITENS_SINCRONIZADOS:
         # ---------------- MODO LISTA BRANCA ----------------
         for item in ITENS_SINCRONIZADOS:
+
+            if _e_padrao_coringa(item):
+                # Item e um padrao com coringa, ex: "*.dll" -> sincroniza
+                # os arquivos que baterem com o padrao, procurando SOMENTE
+                # na pasta raiz do servidor (nao entra em subpastas).
+                encontrou_algum = False
+                try:
+                    nomes_raiz = os.listdir(SERVER_DIR)
+                except Exception as e:
+                    log(f"AVISO: nao foi possivel listar a pasta raiz do "
+                        f"servidor para o padrao '{item}': {e}")
+                    nomes_raiz = []
+
+                for nome in nomes_raiz:
+                    caminho_completo = os.path.join(SERVER_DIR, nome)
+                    if not os.path.isfile(caminho_completo):
+                        continue  # ignora subpastas - o padrao so vale para a raiz
+                    if fnmatch.fnmatch(nome.lower(), item.lower()):
+                        encontrou_algum = True
+                        if _avaliar_candidato(nome, arquivos):
+                            arquivos_ignorados += 1
+
+                if not encontrou_algum:
+                    log(f"AVISO: padrao '{item}' definido em itens_sincronizados "
+                        f"nao encontrou nenhum arquivo correspondente na pasta "
+                        f"raiz do servidor.")
+                continue
+
             origem_item = os.path.join(SERVER_DIR, item)
 
             if os.path.isdir(origem_item):
@@ -733,6 +833,11 @@ def _mostrar_erro_critico() -> None:
 def main() -> None:
     log("=" * 50)
     log("Inicio da verificacao de atualizacao")
+
+    # Autentica a conexao de rede ANTES de checar o servidor, caso o
+    # compartilhamento exija usuario/senha (evita pop-up travando a
+    # automacao). Nao faz nada se network_user estiver vazio no config.ini.
+    autenticar_conexao_rede()
 
     if not servidor_disponivel():
         # Servidor fora do ar / sem acesso -> nao bloqueia o usuario,
